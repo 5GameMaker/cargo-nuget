@@ -1,28 +1,44 @@
 use cargo_toml::{Manifest, Value};
 use futures::future::{BoxFuture, FutureExt};
-use structopt::StructOpt;
 use tokio::runtime::Builder;
 
-use std::env::current_dir;
+use std::env::{args, current_dir};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::process::{Command, Stdio, exit};
 use std::{fs, io};
 
 fn main() {
-    let Opt::Nuget { subcommand } = Opt::from_args();
-    match subcommand {
+    let mut iter = args().peekable();
+    if !iter.next().is_some_and(|x| {
+        x == "cargo-nuget" || x.ends_with("/cargo-nuget") || x.ends_with("\\cargo-nuget")
+    }) && iter.peek().map(|x| x.as_str()) != Some("nuget")
+    {
+        let mut child = Command::new("cargo")
+            .args(iter)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let code = child.wait().unwrap();
+        exit(code.code().unwrap_or(-1));
+    }
+    if iter.peek().map(|x| x.as_str()) == Some("nuget") {
+        iter.next();
+    }
+    match iter.next().as_deref() {
         // TODO: Respect NO_COLOR
         // TODO: Propagate through all packages
-        Subcommand::Install(i) => {
+        Some("install") => {
             #[cfg(unix)]
             {
                 eprintln!(
                     "\x1b[1;33mwarning: \x1b[37mnuget does nothing on *nix. If you've accidentally invoked cargo-nuget in production, make sure to fix this.\x1b[0m"
                 );
             }
-            if let Err(why) = i.perform() {
+            if let Err(why) = (Install {}).perform() {
                 match why {
                     Error::NoWorkspaceRoot => {
                         eprintln!("\x1b[1;31merror: \x1b[37mcould not find workspace.\x1b[0m");
@@ -49,23 +65,19 @@ fn main() {
                 exit(1);
             }
         }
+        Some(x) => {
+            eprintln!("\x1b[1;31merror: \x1b[0mno such command: `{x}`.");
+            exit(1);
+        }
+        None => {
+            eprintln!("Nugget.");
+            eprintln!();
+            eprintln!("\x1b[1;32mUsage: \x1b[1;36mcargo-nuget <COMMAND>");
+            eprintln!();
+            eprintln!("\x1b[1;32mCommands:");
+            eprintln!("  \x1b[1;36minstall  \x1b[0mInstall nuget packages");
+        }
     }
-}
-
-/// A utility for interacting with nuget packages
-#[derive(StructOpt, Debug)]
-#[structopt(bin_name = "cargo")]
-enum Opt {
-    #[structopt(name = "nuget")]
-    Nuget {
-        #[structopt(subcommand)]
-        subcommand: Subcommand,
-    },
-}
-
-#[derive(Debug, StructOpt)]
-enum Subcommand {
-    Install(Install),
 }
 
 #[derive(Debug)]
@@ -83,7 +95,7 @@ impl From<io::Error> for Error {
     }
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug)]
 pub struct Install {}
 
 impl Install {
