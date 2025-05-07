@@ -1,15 +1,14 @@
 use cargo_toml::{Manifest, Value};
-use futures::future::{BoxFuture, FutureExt};
 use tokio::runtime::Builder;
 
 use std::env::{args, current_dir};
-use std::ffi::OsString;
+use std::fmt::Debug;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
 use std::{fs, io};
 
-fn main() {
+async fn _main() {
     let mut iter = args().peekable();
     if !iter.next().is_some_and(|x| {
         x == "cargo-nuget" || x.ends_with("/cargo-nuget") || x.ends_with("\\cargo-nuget")
@@ -38,7 +37,7 @@ fn main() {
                     "\x1b[1;33mwarning: \x1b[37mnuget does nothing on *nix. If you've accidentally invoked cargo-nuget in production, make sure to fix this.\x1b[0m"
                 );
             }
-            if let Err(why) = (Install {}).perform() {
+            if let Err(why) = install(Default::default()).await {
                 match why {
                     Error::NoWorkspaceRoot => {
                         eprintln!("\x1b[1;31merror: \x1b[37mcould not find workspace.\x1b[0m");
@@ -65,6 +64,7 @@ fn main() {
                 exit(1);
             }
         }
+        // TODO: 'cargo-nuget apply' to extract all extra files.
         Some(x) => {
             eprintln!("\x1b[1;31merror: \x1b[0mno such command: `{x}`.");
             exit(1);
@@ -80,56 +80,51 @@ fn main() {
     }
 }
 
-#[derive(Debug)]
-enum Error {
-    NoWorkspaceRoot,
-    MalformedManifest,
-    NoCargoToml,
-    Download(Box<dyn std::error::Error>),
-    Io(io::Error),
-    Other(Box<dyn std::error::Error>),
-}
-impl From<io::Error> for Error {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
-    }
+fn main() {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(_main());
 }
 
-#[derive(Debug)]
-pub struct Install {}
+#[derive(Default)]
+pub struct InstallOptions {}
+async fn install(_: InstallOptions) -> Result<(), Error> {
+    let root = workspace_root()?;
 
-impl Install {
-    fn perform(&self) -> Result<(), Error> {
-        let root = workspace_root()?;
+    let deps = {
         let bytes = std::fs::read(root.join("Cargo.toml")).map_err(|_| Error::NoCargoToml)?;
         let manifest = Manifest::from_slice(&bytes).map_err(|_| Error::MalformedManifest)?;
-        let deps = get_deps(manifest)?;
-        let downloaded_deps = download_dependencies(deps)?;
-        for dep in downloaded_deps {
-            let dep_directory = root.join("target").join("nuget").join(&dep.dependency.name);
-            // create the dependency directory
-            std::fs::create_dir_all(&dep_directory).unwrap();
-            for winmd in dep.winmds() {
-                winmd.write(&dep_directory).unwrap();
-            }
+        get_deps(manifest)?
+    };
 
-            for dll in dep.dlls() {
-                dll.write(&dep_directory).unwrap();
-            }
+    let results = deps.into_iter().map(|dep| {
+        let dep_directory = root.join("target").join("nuget").join(&dep.name);
+        async move { dep.install(&dep_directory).await }
+    });
+
+    let deps: DepInfo = futures::future::try_join_all(results)
+        .await?
+        .into_iter()
+        .collect();
+
+    let mut cflags = std::env::var("CFLAGS").unwrap_or_default();
+    for x in deps.include {
+        println!("include += {x:?}");
+        if !cflags.is_empty() {
+            cflags.push(' ');
         }
-
-        Ok(())
+        cflags += &format!("-I{x:?}");
     }
-}
 
-fn workspace_root() -> Result<PathBuf, Error> {
-    // TODO: improve it again
-    current_dir()
-        .unwrap()
-        .ancestors()
-        .find(|x| fs::File::open(x.join("Cargo.toml")).is_ok())
-        .map(|x| x.to_path_buf())
-        .ok_or(Error::NoWorkspaceRoot)
+    if let Ok(x) = std::env::var("GITHUB_ENV") {
+        eprintln!();
+        eprintln!("Exporting to env file!");
+        fs::write(x, format!("CFLAGS={cflags}"))?;
+    }
+
+    Ok(())
 }
 
 fn get_deps(manifest: Manifest) -> Result<Vec<Dependency>, Error> {
@@ -170,7 +165,6 @@ struct Dependency {
     name: String,
     version: String,
 }
-
 impl Dependency {
     fn new(name: String, version: String) -> Self {
         Self { name, version }
@@ -183,164 +177,195 @@ impl Dependency {
         )
     }
 
-    async fn download(&self) -> Result<Vec<u8>, Error> {
-        fn try_download(
+    async fn install(&self, install_dir: &Path) -> Result<DepInfo, Error> {
+        fs::remove_dir_all(install_dir).ok();
+
+        async fn try_install(
             url: String,
             recursion_amount: u8,
-        ) -> BoxFuture<'static, Result<Vec<u8>, Error>> {
-            async move {
-                if recursion_amount == 0 {
-                    return Err(Error::Download("Too many redirects".into()));
-                }
-                let res = reqwest::get(&url)
-                    .await
-                    .map_err(|e| Error::Download(e.into()))?;
-                match res.status().into() {
-                    200u16 => {
-                        let bytes = res.bytes().await.map_err(|e| Error::Download(e.into()))?;
-                        Ok(bytes.into_iter().collect())
-                    }
-                    302 => {
-                        let headers = res.headers();
-                        let redirect_url = headers.get("Location").unwrap();
-
-                        let url = redirect_url.to_str().unwrap();
-
-                        try_download(url.to_owned(), recursion_amount - 1).await
-                    }
-                    _ => Err(Error::Download(
-                        format!("Non-successful response: {}", res.status()).into(),
-                    )),
-                }
+            name: &str,
+            version: &str,
+        ) -> Result<Vec<u8>, Error> {
+            if recursion_amount == 0 {
+                return Err(Error::Download("Too many redirects".into()));
             }
-            .boxed()
+            let res = reqwest::get(&url)
+                .await
+                .map_err(|e| Error::Download(e.into()))?;
+            match res.status().into() {
+                200u16 => {
+                    let bytes = res.bytes().await.map_err(|e| Error::Download(e.into()))?;
+                    eprintln!(
+                        "\x1b[1;32mDownloaded \x1b[0m{name} v{version} ({} bytes)",
+                        bytes.len()
+                    );
+                    Ok(bytes.into_iter().collect())
+                }
+                302 => {
+                    let headers = res.headers();
+                    let redirect_url = headers.get("Location").unwrap();
+
+                    let url = redirect_url.to_str().unwrap();
+
+                    Box::pin(try_install(
+                        url.to_owned(),
+                        recursion_amount - 1,
+                        name,
+                        version,
+                    ))
+                    .await
+                }
+                _ => Err(Error::Download(
+                    format!("Non-successful response: {}", res.status()).into(),
+                )),
+            }
         }
 
-        try_download(self.url(), 5).await
-    }
-}
+        let mut definfo = DepInfo::default();
 
-struct DownloadedDependency {
-    dependency: Dependency,
-    contents: (Vec<Winmd>, Vec<Dll>),
-}
-
-impl DownloadedDependency {
-    fn new(dependency: Dependency, bytes: Vec<u8>) -> Result<Self, Error> {
-        let contents = Self::read_contents(&bytes)?;
-        Ok(Self {
-            dependency,
-            contents,
-        })
-    }
-
-    fn winmds(&self) -> &[Winmd] {
-        &self.contents.0
-    }
-
-    fn dlls(&self) -> &[Dll] {
-        &self.contents.1
-    }
-
-    fn read_contents(zip: &[u8]) -> Result<(Vec<Winmd>, Vec<Dll>), Error> {
-        let reader = std::io::Cursor::new(zip);
+        let bytes = try_install(self.url(), 5, &self.name, &self.version).await?;
+        let reader = std::io::Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(reader).map_err(|e| Error::Other(Box::new(e)))?;
-        let mut winmds = Vec::new();
-        let mut dlls = Vec::new();
+        let mut data = Vec::new();
         for i in 0..zip.len() {
             let mut file = zip.by_index(i).unwrap();
             let path = file.enclosed_name().unwrap();
-            match path.extension() {
-                Some(e)
-                    if e == "winmd"
-                        && path.parent().and_then(Path::to_str) == Some("lib\\uap10.0") =>
-                {
-                    let name = path.file_name().unwrap().to_owned();
-                    let mut contents = Vec::with_capacity(file.size() as usize);
 
-                    if let Err(e) = file.read_to_end(&mut contents) {
-                        eprintln!("Could not read winmd file: {e:?}");
-                        continue;
-                    }
-                    winmds.push(Winmd { name, contents });
-                }
-                Some(e) if e == "dll" && path.starts_with("runtimes") => {
-                    let name: PathBuf = path
-                        .components()
-                        .filter(|c| match c {
-                            std::path::Component::Normal(p) => *p != "native" && *p != "runtimes",
-                            _ => panic!("Unexpected component"),
+            fs::create_dir_all(install_dir.join(&path).parent().unwrap())?;
+            data.clear();
+            let bytes = {
+                let len = file.read_to_end(&mut data)?;
+                &data[0..len]
+            };
+            fs::write(install_dir.join(&path), bytes)?;
+
+            match path.extension().map(|x| x.to_string_lossy()).as_deref() {
+                Some(_)
+                    if path.ancestors().any(|x| {
+                        x.file_name().is_some_and(|x| {
+                            let s = x.to_string_lossy();
+                            s == "include"
                         })
-                        .collect();
-                    let mut contents = Vec::with_capacity(file.size() as usize);
-
-                    if let Err(e) = file.read_to_end(&mut contents) {
-                        eprintln!("Could not read dll: {e:?}");
-                        continue;
-                    }
-                    dlls.push(Dll { name, contents });
+                    }) =>
+                {
+                    definfo
+                        .add_include_path(install_dir.join(&path).parent().unwrap().to_path_buf());
                 }
                 _ => {}
             }
+
+            // match path.extension() {
+            //     Some(e)
+            //         if e == "winmd"
+            //             && path.parent().and_then(Path::to_str) == Some("lib\\uap10.0") =>
+            //     {
+            //         let name = path.file_name().unwrap().to_owned();
+            //         let mut contents = Vec::with_capacity(file.size() as usize);
+
+            //         if let Err(e) = file.read_to_end(&mut contents) {
+            //             eprintln!("Could not read winmd file: {e:?}");
+            //             continue;
+            //         }
+            //         winmds.push(Winmd { name, contents });
+            //     }
+            //     Some(e) if e == "dll" && path.starts_with("runtimes") => {
+            //         let name: PathBuf = path
+            //             .components()
+            //             .filter(|c| match c {
+            //                 std::path::Component::Normal(p) => *p != "native" && *p != "runtimes",
+            //                 _ => panic!("Unexpected component"),
+            //             })
+            //             .collect();
+            //         let mut contents = Vec::with_capacity(file.size() as usize);
+
+            //         if let Err(e) = file.read_to_end(&mut contents) {
+            //             eprintln!("Could not read dll: {e:?}");
+            //             continue;
+            //         }
+            //         dlls.push(Dll { name, contents });
+            //     }
+            //     _ => {}
+            // }
         }
-        Ok((winmds, dlls))
+
+        Ok(definfo)
     }
 }
 
-fn download_dependencies(deps: Vec<Dependency>) -> Result<Vec<DownloadedDependency>, Error> {
-    Builder::new_current_thread()
-        .enable_all()
-        .build()
+#[derive(Default)]
+struct DepInfo {
+    pub include: Vec<PathBuf>,
+}
+impl DepInfo {
+    fn add_include_path(&mut self, path: PathBuf) {
+        if !self.include.iter().any(|x| path.starts_with(x)) {
+            self.include.push(path);
+        }
+    }
+}
+impl FromIterator<DepInfo> for DepInfo {
+    fn from_iter<T: IntoIterator<Item = DepInfo>>(iter: T) -> Self {
+        let mut info = DepInfo::default();
+        for x in iter {
+            info.include.extend(x.include);
+        }
+        info
+    }
+}
+
+// struct Dll {
+//     name: PathBuf,
+//     contents: Vec<u8>,
+// }
+//
+// impl Dll {
+//     fn write(&self, dir: &Path) -> Result<(), Error> {
+//         let path = dir.join(&self.name);
+//
+//         if !path.exists() {
+//             std::fs::create_dir_all(path.parent().unwrap())?;
+//             std::fs::write(&path, &self.contents)?;
+//         }
+//         for profile in &["debug", "release"] {
+//             let profile_path = workspace_root()?.join("target").join(profile);
+//             std::fs::create_dir_all(&profile_path)?;
+//             let arch = self.name.parent().unwrap();
+//             let dll_path = profile_path.join(self.name.strip_prefix(arch).unwrap());
+//             if arch.as_os_str() == ARCH && std::fs::read_link(&dll_path).is_err() {
+//                 #[cfg(windows)]
+//                 std::os::windows::fs::symlink_file(&path, dll_path)?;
+//                 #[cfg(unix)]
+//                 std::os::unix::fs::symlink(&path, dll_path)?;
+//             }
+//         }
+//
+//         Ok(())
+//     }
+// }
+
+#[derive(Debug)]
+enum Error {
+    NoWorkspaceRoot,
+    MalformedManifest,
+    NoCargoToml,
+    Download(Box<dyn std::error::Error>),
+    Io(io::Error),
+    Other(Box<dyn std::error::Error>),
+}
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+fn workspace_root() -> Result<PathBuf, Error> {
+    // TODO: improve it again
+    current_dir()
         .unwrap()
-        .block_on(async {
-            let results = deps.into_iter().map(|dep| async move {
-                let bytes = dep.download().await?;
-                DownloadedDependency::new(dep, bytes)
-            });
-
-            futures::future::try_join_all(results).await
-        })
-}
-
-struct Winmd {
-    name: OsString,
-    contents: Vec<u8>,
-}
-
-impl Winmd {
-    fn write(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::write(dir.join(&self.name), &self.contents)
-    }
-}
-
-struct Dll {
-    name: PathBuf,
-    contents: Vec<u8>,
-}
-
-impl Dll {
-    fn write(&self, dir: &Path) -> Result<(), Error> {
-        let path = dir.join(&self.name);
-
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, &self.contents)?;
-        }
-        for profile in &["debug", "release"] {
-            let profile_path = workspace_root()?.join("target").join(profile);
-            std::fs::create_dir_all(&profile_path)?;
-            let arch = self.name.parent().unwrap();
-            let dll_path = profile_path.join(self.name.strip_prefix(arch).unwrap());
-            if arch.as_os_str() == ARCH && std::fs::read_link(&dll_path).is_err() {
-                #[cfg(windows)]
-                std::os::windows::fs::symlink_file(&path, dll_path)?;
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&path, dll_path)?;
-            }
-        }
-
-        Ok(())
-    }
+        .ancestors()
+        .find(|x| fs::File::open(x.join("Cargo.toml")).is_ok())
+        .map(|x| x.to_path_buf())
+        .ok_or(Error::NoWorkspaceRoot)
 }
 
 #[cfg(target_arch = "x86_64")]

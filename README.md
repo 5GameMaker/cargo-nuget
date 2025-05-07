@@ -2,12 +2,14 @@
 
 A simple utility for working with NuGet packages in a Rust project in a way that [WinRT-rs](https://github.com/microsoft/winrt-rs) can understand. 
 
+Now with github support!
+
 ## Installation
 
 To install `cargo nuget` run the following:
 
 ```
-cargo install --git https://github.com/rylev/cargo-nuget
+cargo install --git https://github.com/5GameMaker/cargo-nuget
 ```
 
 ## Usage
