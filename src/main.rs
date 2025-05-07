@@ -277,6 +277,7 @@ impl DownloadedDependency {
 
 fn download_dependencies(deps: Vec<Dependency>) -> Result<Vec<DownloadedDependency>, Error> {
     Builder::new_current_thread()
+        .enable_io()
         .build()
         .unwrap()
         .block_on(async {
