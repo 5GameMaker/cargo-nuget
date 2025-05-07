@@ -1,16 +1,54 @@
 use cargo_toml::{Manifest, Value};
 use futures::future::{BoxFuture, FutureExt};
 use structopt::StructOpt;
-use thiserror::Error;
+use tokio::runtime::Builder;
 
+use std::env::current_dir;
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::{fs, io};
 
 fn main() {
     let Opt::Nuget { subcommand } = Opt::from_args();
     match subcommand {
-        Subcommand::Install(i) => i.perform().unwrap(),
+        // TODO: Respect NO_COLOR
+        // TODO: Propagate through all packages
+        Subcommand::Install(i) => {
+            #[cfg(unix)]
+            {
+                eprintln!(
+                    "\x1b[1;33mwarning: \x1b[37mnuget does nothing on *nix. If you've accidentally invoked cargo-nuget in production, make sure to fix this.\x1b[0m"
+                );
+            }
+            if let Err(why) = i.perform() {
+                match why {
+                    Error::NoWorkspaceRoot => {
+                        eprintln!("\x1b[1;31merror: \x1b[37mcould not find workspace.\x1b[0m");
+                    }
+                    Error::NoCargoToml => {
+                        eprintln!("\x1b[1;31merror: \x1b[37mcould not find Cargo.toml.\x1b[0m");
+                    }
+                    Error::MalformedManifest => {
+                        eprintln!(
+                            "\x1b[1;31merror: \x1b[37mCargo.toml is of an incorrect format.\x1b[0m"
+                        );
+                    }
+                    // TODO: this error message sucks ass
+                    Error::Download(error) => {
+                        eprintln!("\x1b[1;31merror: \x1b[37mdownload failed.\x1b[0m\n\n{error:#}");
+                    }
+                    Error::Io(error) => {
+                        eprintln!("\x1b[1;31mio error: {error:#}\x1b[0m");
+                    }
+                    Error::Other(error) => {
+                        eprintln!("\x1b[1;31m{error:#}\x1b[0m");
+                    }
+                }
+                exit(1);
+            }
+        }
     }
 }
 
@@ -30,16 +68,19 @@ enum Subcommand {
     Install(Install),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 enum Error {
-    #[error("No Cargo.toml could be found")]
-    NoCargoToml,
-    #[error("There was an error downloading the NuGet package {0}")]
-    DownloadError(Box<dyn std::error::Error>),
-    #[error("The Cargo.toml file was malformed")]
+    NoWorkspaceRoot,
     MalformedManifest,
-    #[error("There was some other error {0}")]
+    NoCargoToml,
+    Download(Box<dyn std::error::Error>),
+    Io(io::Error),
     Other(Box<dyn std::error::Error>),
+}
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 #[derive(Debug, StructOpt)]
@@ -47,15 +88,13 @@ pub struct Install {}
 
 impl Install {
     fn perform(&self) -> Result<(), Error> {
-        let bytes = std::fs::read("Cargo.toml").map_err(|_| Error::NoCargoToml)?;
+        let root = workspace_root()?;
+        let bytes = std::fs::read(root.join("Cargo.toml")).map_err(|_| Error::NoCargoToml)?;
         let manifest = Manifest::from_slice(&bytes).map_err(|_| Error::MalformedManifest)?;
         let deps = get_deps(manifest)?;
         let downloaded_deps = download_dependencies(deps)?;
         for dep in downloaded_deps {
-            let dep_directory = workspace_root()
-                .join("target")
-                .join("nuget")
-                .join(&dep.dependency.name);
+            let dep_directory = root.join("target").join("nuget").join(&dep.dependency.name);
             // create the dependency directory
             std::fs::create_dir_all(&dep_directory).unwrap();
             for winmd in dep.winmds() {
@@ -71,9 +110,14 @@ impl Install {
     }
 }
 
-fn workspace_root() -> PathBuf {
-    // TODO: improve this
-    PathBuf::new()
+fn workspace_root() -> Result<PathBuf, Error> {
+    // TODO: improve it again
+    current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|x| fs::File::open(x.join("Cargo.toml")).is_ok())
+        .map(|x| x.to_path_buf())
+        .ok_or(Error::NoWorkspaceRoot)
 }
 
 fn get_deps(manifest: Manifest) -> Result<Vec<Dependency>, Error> {
@@ -82,16 +126,30 @@ fn get_deps(manifest: Manifest) -> Result<Vec<Dependency>, Error> {
         Some(Value::Table(mut t)) => {
             let deps = match t.remove("nuget_dependencies") {
                 Some(Value::Table(deps)) => deps,
-                _ => return Err(Error::MalformedManifest.into()),
+                _ => {
+                    eprintln!("\x1b[1;33mwarning: \x1b[37mno nuget packages are defined.\x1b[0m");
+                    eprintln!();
+                    eprintln!("\x1b[1;38;5;39mnote: \x1b[37madd them to Cargo.toml:.\x1b[0m");
+                    eprintln!("\x1b[1;38;5;39m  | [package.metadata.nuget_dependencies]\x1b[0m");
+                    eprintln!("\x1b[1;38;5;39m  | \"Win2D.uwp\" = \"1.25.0\"\x1b[0m");
+                    return Ok(vec![]);
+                }
             };
             deps.into_iter()
                 .map(|(key, value)| match value {
                     Value::String(version) => Ok(Dependency::new(key, version)),
-                    _ => Err(Error::MalformedManifest.into()),
+                    _ => Err(Error::MalformedManifest),
                 })
                 .collect()
         }
-        _ => return Err(Error::MalformedManifest.into()),
+        _ => {
+            eprintln!("\x1b[1;33mwarning: \x1b[37mno nuget packages are defined.\x1b[0m");
+            eprintln!();
+            eprintln!("\x1b[1;38;5;33mnote: \x1b[37madd them to Cargo.toml:.\x1b[0m");
+            eprintln!("\x1b[1;38;5;33m  | [package.metadata.nuget_dependencies]\x1b[0m");
+            eprintln!("\x1b[1;38;5;33m  | \"Win2D.uwp\" = \"1.25.0\"\x1b[0m");
+            Ok(vec![])
+        }
     }
 }
 
@@ -120,19 +178,14 @@ impl Dependency {
         ) -> BoxFuture<'static, Result<Vec<u8>, Error>> {
             async move {
                 if recursion_amount == 0 {
-                    return Err(Error::DownloadError(
-                        anyhow::anyhow!("Too many redirects").into(),
-                    ));
+                    return Err(Error::Download("Too many redirects".into()));
                 }
                 let res = reqwest::get(&url)
                     .await
-                    .map_err(|e| Error::DownloadError(e.into()))?;
+                    .map_err(|e| Error::Download(e.into()))?;
                 match res.status().into() {
                     200u16 => {
-                        let bytes = res
-                            .bytes()
-                            .await
-                            .map_err(|e| Error::DownloadError(e.into()))?;
+                        let bytes = res.bytes().await.map_err(|e| Error::Download(e.into()))?;
                         Ok(bytes.into_iter().collect())
                     }
                     302 => {
@@ -143,11 +196,9 @@ impl Dependency {
 
                         try_download(url.to_owned(), recursion_amount - 1).await
                     }
-                    _ => {
-                        return Err(Error::DownloadError(
-                            anyhow::anyhow!("Non-successful response: {}", res.status()).into(),
-                        ))
-                    }
+                    _ => Err(Error::Download(
+                        format!("Non-successful response: {}", res.status()).into(),
+                    )),
                 }
             }
             .boxed()
@@ -186,7 +237,7 @@ impl DownloadedDependency {
         let mut dlls = Vec::new();
         for i in 0..zip.len() {
             let mut file = zip.by_index(i).unwrap();
-            let path = file.sanitized_name();
+            let path = file.enclosed_name().unwrap();
             match path.extension() {
                 Some(e)
                     if e == "winmd"
@@ -196,7 +247,7 @@ impl DownloadedDependency {
                     let mut contents = Vec::with_capacity(file.size() as usize);
 
                     if let Err(e) = file.read_to_end(&mut contents) {
-                        eprintln!("Could not read winmd file: {:?}", e);
+                        eprintln!("Could not read winmd file: {e:?}");
                         continue;
                     }
                     winmds.push(Winmd { name, contents });
@@ -212,7 +263,7 @@ impl DownloadedDependency {
                     let mut contents = Vec::with_capacity(file.size() as usize);
 
                     if let Err(e) = file.read_to_end(&mut contents) {
-                        eprintln!("Could not read dll: {:?}", e);
+                        eprintln!("Could not read dll: {e:?}");
                         continue;
                     }
                     dlls.push(Dll { name, contents });
@@ -225,14 +276,17 @@ impl DownloadedDependency {
 }
 
 fn download_dependencies(deps: Vec<Dependency>) -> Result<Vec<DownloadedDependency>, Error> {
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let results = deps.into_iter().map(|dep| async move {
-            let bytes = dep.download().await?;
-            Ok(DownloadedDependency::new(dep, bytes)?)
-        });
+    Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let results = deps.into_iter().map(|dep| async move {
+                let bytes = dep.download().await?;
+                DownloadedDependency::new(dep, bytes)
+            });
 
-        futures::future::try_join_all(results).await
-    })
+            futures::future::try_join_all(results).await
+        })
 }
 
 struct Winmd {
@@ -252,7 +306,7 @@ struct Dll {
 }
 
 impl Dll {
-    fn write(&self, dir: &Path) -> std::io::Result<()> {
+    fn write(&self, dir: &Path) -> Result<(), Error> {
         let path = dir.join(&self.name);
 
         if !path.exists() {
@@ -260,12 +314,15 @@ impl Dll {
             std::fs::write(&path, &self.contents)?;
         }
         for profile in &["debug", "release"] {
-            let profile_path = workspace_root().join("target").join(profile);
+            let profile_path = workspace_root()?.join("target").join(profile);
             std::fs::create_dir_all(&profile_path)?;
             let arch = self.name.parent().unwrap();
-            let dll_path = profile_path.join(&self.name.strip_prefix(&arch).unwrap());
+            let dll_path = profile_path.join(self.name.strip_prefix(arch).unwrap());
             if arch.as_os_str() == ARCH && std::fs::read_link(&dll_path).is_err() {
+                #[cfg(windows)]
                 std::os::windows::fs::symlink_file(&path, dll_path)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&path, dll_path)?;
             }
         }
 
